@@ -4,10 +4,12 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 import torch.distributed as distributed
+from torch.optim import Optimizer
 from torch.cuda.amp import autocast
 
 from einops import rearrange, repeat, reduce, pack, unpack
-from contextlib import contextmanager
+
+from typing import Callable
 
 def exists(val):
     return val is not None
@@ -24,8 +26,22 @@ def identity(t):
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
 
+def cdist(x, y):
+    x2 = reduce(x ** 2, 'b n d -> b n', 'sum')
+    y2 = reduce(y ** 2, 'b n d -> b n', 'sum')
+    xy = einsum('b i d, b j d -> b i j', x, y) * -2
+    return (rearrange(x2, 'b i -> b i 1') + rearrange(y2, 'b j -> b 1 j') + xy).sqrt()
+
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
+
+def ema_inplace(old, new, decay):
+    is_mps = str(old.device).startswith('mps:')
+
+    if not is_mps:
+        old.lerp_(new, 1 - decay)
+    else:
+        old.mul_(decay).add_(new * (1 - decay))
 
 def pack_one(t, pattern):
     return pack([t], pattern)
@@ -64,7 +80,7 @@ def gumbel_sample(
     assert not (reinmax and not straight_through), 'reinmax can only be turned on if using straight through gumbel softmax'
 
     if not straight_through or temperature <= 0. or not training:
-        return ind, one_hot, None
+        return ind, one_hot
 
     # use reinmax for better second-order accuracy - https://arxiv.org/abs/2304.08612
     # algorithm 2
@@ -79,9 +95,7 @@ def gumbel_sample(
         π1 = (logits / temperature).softmax(dim = dim)
         one_hot = one_hot + π1 - π1.detach()
 
-    st_mult = one_hot.gather(-1, rearrange(ind, '... -> ... 1')) # multiplier for straight-through
-
-    return ind, one_hot, st_mult
+    return ind, one_hot
 
 def laplace_smoothing(x, n_categories, eps = 1e-5, dim = -1):
     denom = x.sum(dim = dim, keepdim = True)
@@ -296,13 +310,19 @@ class EuclideanCodebook(nn.Module):
         self.register_buffer('batch_mean', None)
         self.register_buffer('batch_variance', None)
 
-        self.register_buffer('codebook_mean', None)
-        self.register_buffer('codebook_variance', None)
+        self.register_buffer('codebook_mean_needs_init', torch.Tensor([True]))
+        self.register_buffer('codebook_mean', torch.empty(num_codebooks, 1, dim))
+        self.register_buffer('codebook_variance_needs_init', torch.Tensor([True]))
+        self.register_buffer('codebook_variance', torch.empty(num_codebooks, 1, dim))
 
     @torch.jit.ignore
-    def init_embed_(self, data):
+    def init_embed_(self, data, mask = None):
         if self.initted:
             return
+
+        if exists(mask):
+            c = data.shape[0]
+            data = rearrange(data[mask], '(c n) d -> c n d', c = c)
 
         embed, cluster_size = kmeans(
             data,
@@ -312,8 +332,10 @@ class EuclideanCodebook(nn.Module):
             all_reduce_fn = self.kmeans_all_reduce_fn
         )
 
+        embed_sum = embed * rearrange(cluster_size, '... -> ... 1')
+
         self.embed.data.copy_(embed)
-        self.embed_avg.data.copy_(embed.clone())
+        self.embed_avg.data.copy_(embed_sum)
         self.cluster_size.data.copy_(cluster_size)
         self.initted.data.copy_(torch.Tensor([True]))
 
@@ -321,23 +343,42 @@ class EuclideanCodebook(nn.Module):
     def update_with_decay(self, buffer_name, new_value, decay):
         old_value = getattr(self, buffer_name)
 
-        if not exists(old_value):
-            self.register_buffer(buffer_name, new_value)
+        needs_init = getattr(self, buffer_name + "_needs_init", False)
+
+        if needs_init:
+            self.register_buffer(buffer_name + "_needs_init", torch.Tensor([False]))
+
+        if not exists(old_value) or needs_init:
+            self.register_buffer(buffer_name, new_value.detach())
+
             return
 
-        value = old_value * decay + new_value * (1 - decay)
+        value = old_value * decay + new_value.detach() * (1 - decay)
         self.register_buffer(buffer_name, value)
 
     @torch.jit.ignore
-    def update_affine(self, data, embed):
+    def update_affine(self, data, embed, mask = None):
         assert self.affine_param
 
         var_fn = partial(torch.var, unbiased = False)
 
-        data, embed = map(lambda t: rearrange(t, 'h ... d -> h (...) d'), (data, embed))
+        # calculate codebook mean and variance
 
-        self.update_with_decay('codebook_mean', reduce(embed, 'h n d -> h 1 d', 'mean'), self.affine_param_codebook_decay)
-        self.update_with_decay('codebook_variance', reduce(embed, 'h n d -> h 1 d', var_fn), self.affine_param_codebook_decay)
+        embed = rearrange(embed, 'h ... d -> h (...) d')
+
+        if self.training:
+            self.update_with_decay('codebook_mean', reduce(embed, 'h n d -> h 1 d', 'mean'), self.affine_param_codebook_decay)
+            self.update_with_decay('codebook_variance', reduce(embed, 'h n d -> h 1 d', var_fn), self.affine_param_codebook_decay)
+
+        # prepare batch data, which depends on whether it has masking
+
+        data = rearrange(data, 'h ... d -> h (...) d')
+
+        if exists(mask):
+            c = data.shape[0]
+            data = rearrange(data[mask], '(c n) d -> c n d', c = c)
+
+        # calculate batch mean and variance
 
         if not self.sync_affine_param:
             self.update_with_decay('batch_mean', reduce(data, 'h n d -> h 1 d', 'mean'), self.affine_param_batch_decay)
@@ -396,7 +437,9 @@ class EuclideanCodebook(nn.Module):
     def forward(
         self,
         x,
-        sample_codebook_temp = None
+        sample_codebook_temp = None,
+        mask = None,
+        freeze_codebook = False
     ):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -409,10 +452,13 @@ class EuclideanCodebook(nn.Module):
         dtype = x.dtype
         flatten, ps = pack_one(x, 'h * d')
 
-        self.init_embed_(flatten)
+        if exists(mask):
+            mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
+
+        self.init_embed_(flatten, mask = mask)
 
         if self.affine_param:
-            self.update_affine(flatten, self.embed)
+            self.update_affine(flatten, self.embed, mask = mask)
 
         embed = self.embed if self.learnable_codebook else self.embed.detach()
 
@@ -421,31 +467,34 @@ class EuclideanCodebook(nn.Module):
             batch_std = self.batch_variance.clamp(min = 1e-5).sqrt()
             embed = (embed - self.codebook_mean) * (batch_std / codebook_std) + self.batch_mean
 
-        dist = -torch.cdist(flatten, embed, p = 2)
+        dist = -cdist(flatten, embed)
 
-        embed_ind, embed_onehot, straight_through_mult = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
+        embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
 
         embed_ind = unpack_one(embed_ind, ps, 'h *')
 
-        quantize = batched_embedding(embed_ind, self.embed)
+        if self.training:
+            unpacked_onehot = unpack_one(embed_onehot, ps, 'h * c')
+            quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+        else:
+            quantize = batched_embedding(embed_ind, embed)
 
-        if exists(straight_through_mult):
-            mult = unpack_one(straight_through_mult, ps, 'h * d')
-            quantize = quantize * mult
-
-        if self.training and self.ema_update:
+        if self.training and self.ema_update and not freeze_codebook:
 
             if self.affine_param:
                 flatten = (flatten - self.batch_mean) * (codebook_std / batch_std) + self.codebook_mean
 
+            if exists(mask):
+                embed_onehot[~mask] = 0.
+
             cluster_size = embed_onehot.sum(dim = 1)
 
             self.all_reduce_fn(cluster_size)
-            self.cluster_size.data.lerp_(cluster_size, 1 - self.decay)
+            ema_inplace(self.cluster_size.data, cluster_size, self.decay)
 
             embed_sum = einsum('h n d, h n c -> h c d', flatten, embed_onehot)
             self.all_reduce_fn(embed_sum.contiguous())
-            self.embed_avg.data.lerp_(embed_sum, 1 - self.decay)
+            ema_inplace(self.embed_avg.data, embed_sum, self.decay)
 
             cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
 
@@ -517,9 +566,13 @@ class CosineSimCodebook(nn.Module):
             self.register_buffer('embed', embed)
 
     @torch.jit.ignore
-    def init_embed_(self, data):
+    def init_embed_(self, data, mask = None):
         if self.initted:
             return
+
+        if exists(mask):
+            c = data.shape[0]
+            data = rearrange(data[mask], '(c n) d -> c n d', c = c)
 
         embed, cluster_size = kmeans(
             data,
@@ -530,8 +583,10 @@ class CosineSimCodebook(nn.Module):
             all_reduce_fn = self.kmeans_all_reduce_fn
         )
 
+        embed_sum = embed * rearrange(cluster_size, '... -> ... 1')
+
         self.embed.data.copy_(embed)
-        self.embed_avg.data.copy_(embed.clone())
+        self.embed_avg.data.copy_(embed_sum)
         self.cluster_size.data.copy_(cluster_size)
         self.initted.data.copy_(torch.Tensor([True]))
 
@@ -565,7 +620,9 @@ class CosineSimCodebook(nn.Module):
     def forward(
         self,
         x,
-        sample_codebook_temp = None
+        sample_codebook_temp = None,
+        mask = None,
+        freeze_codebook = False
     ):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -579,30 +636,36 @@ class CosineSimCodebook(nn.Module):
 
         flatten, ps = pack_one(x, 'h * d')
 
-        self.init_embed_(flatten)
+        if exists(mask):
+            mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
+
+        self.init_embed_(flatten, mask = mask)
 
         embed = self.embed if self.learnable_codebook else self.embed.detach()
 
         dist = einsum('h n d, h c d -> h n c', flatten, embed)
 
-        embed_ind, embed_onehot, straight_through_mult = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
+        embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
         embed_ind = unpack_one(embed_ind, ps, 'h *')
 
-        quantize = batched_embedding(embed_ind, self.embed)
+        if self.training:
+            unpacked_onehot = unpack_one(embed_onehot, ps, 'h * c')
+            quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+        else:
+            quantize = batched_embedding(embed_ind, embed)
 
-        if exists(straight_through_mult):
-            mult = unpack_one(straight_through_mult, ps, 'h * d')
-            quantize = quantize * mult
+        if self.training and self.ema_update and not freeze_codebook:
+            if exists(mask):
+                embed_onehot[~mask] = 0.
 
-        if self.training and self.ema_update:
             bins = embed_onehot.sum(dim = 1)
             self.all_reduce_fn(bins)
 
-            self.cluster_size.data.lerp_(bins, 1 - self.decay)
+            ema_inplace(self.cluster_size.data, bins, self.decay)
 
             embed_sum = einsum('h n d, h n c -> h c d', flatten, embed_onehot)
             self.all_reduce_fn(embed_sum.contiguous())
-            self.embed_avg.data.lerp_(embed_sum, 1 - self.decay)
+            ema_inplace(self.embed_avg.data, embed_sum, self.decay)
 
             cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
 
@@ -630,6 +693,7 @@ class VectorQuantize(nn.Module):
         separate_codebook_per_head = False,
         decay = 0.8,
         eps = 1e-5,
+        freeze_codebook = False,
         kmeans_init = False,
         kmeans_iters = 10,
         sync_kmeans = True,
@@ -646,10 +710,11 @@ class VectorQuantize(nn.Module):
         sample_codebook_temp = 1.,
         straight_through = False,
         reinmax = False,  # using reinmax for improved straight-through, assuming straight through helps at all
-        sync_codebook = False,
+        sync_codebook = None,
         sync_affine_param = False,
         ema_update = True,
         learnable_codebook = False,
+        in_place_codebook_optimizer: Callable[..., Optimizer] = None, # Optimizer used to update the codebook embedding if using learnable_codebook
         affine_param = False,
         affine_param_batch_decay = 0.99,
         affine_param_codebook_decay = 0.9,
@@ -670,6 +735,8 @@ class VectorQuantize(nn.Module):
         self.eps = eps
         self.commitment_weight = commitment_weight
         self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss # whether to use cross entropy loss to codebook as commitment loss
+
+        self.learnable_codebook = learnable_codebook
 
         has_codebook_orthogonal_loss = orthogonal_reg_weight > 0
         self.has_codebook_orthogonal_loss = has_codebook_orthogonal_loss
@@ -693,6 +760,9 @@ class VectorQuantize(nn.Module):
             straight_through = straight_through
         )
 
+        if not exists(sync_codebook):
+            sync_codebook = distributed.is_initialized() and distributed.get_world_size() > 1
+
         codebook_kwargs = dict(
             dim = codebook_dim,
             num_codebooks = heads if separate_codebook_per_head else 1,
@@ -711,7 +781,7 @@ class VectorQuantize(nn.Module):
         )
 
         if affine_param:
-            assert not use_cosine_sim
+            assert not use_cosine_sim, 'affine param is only compatible with euclidean codebook'
             codebook_kwargs = dict(
                 **codebook_kwargs,
                 affine_param = True,
@@ -722,6 +792,8 @@ class VectorQuantize(nn.Module):
 
         self._codebook = codebook_class(**codebook_kwargs)
 
+        self.in_place_codebook_optimizer = in_place_codebook_optimizer(self._codebook.parameters()) if exists(in_place_codebook_optimizer) else None
+
         self.codebook_size = codebook_size
 
         self.accept_image_fmap = accept_image_fmap
@@ -730,10 +802,18 @@ class VectorQuantize(nn.Module):
     @property
     def codebook(self):
         codebook = self._codebook.embed
+
         if self.separate_codebook_per_head:
             return codebook
 
         return rearrange(codebook, '1 ... -> ...')
+
+    @codebook.setter
+    def codebook(self, codes):
+        if not self.separate_codebook_per_head:
+            codes = rearrange(codes, '... -> 1 ...')
+
+        self._codebook.embed.copy_(codes)
 
     def get_codes_from_indices(self, indices):
         codebook = self.codebook
@@ -759,16 +839,21 @@ class VectorQuantize(nn.Module):
         x,
         indices = None,
         mask = None,
-        sample_codebook_temp = None
+        sample_codebook_temp = None,
+        freeze_codebook = False
     ):
+        orig_input = x
+
         only_one = x.ndim == 2
 
         if only_one:
+            assert not exists(mask)
             x = rearrange(x, 'b d -> b 1 d')
 
         shape, device, heads, is_multiheaded, codebook_size, return_loss = x.shape, x.device, self.heads, self.heads > 1, self.codebook_size, exists(indices)
 
         need_transpose = not self.channel_last and not self.accept_image_fmap
+        should_inplace_optimize = exists(self.in_place_codebook_optimizer)
 
         # rearrange inputs
 
@@ -793,12 +878,51 @@ class VectorQuantize(nn.Module):
 
         x = self._codebook.transform_input(x)
 
+        # codebook forward kwargs
+
+        codebook_forward_kwargs = dict(
+            sample_codebook_temp = sample_codebook_temp,
+            mask = mask,
+            freeze_codebook = freeze_codebook
+        )
+
         # quantize
 
-        quantize, embed_ind, distances = self._codebook(x, sample_codebook_temp = sample_codebook_temp)
+        quantize, embed_ind, distances = self._codebook(x, **codebook_forward_kwargs)
+
+        # one step in-place update
+
+        if should_inplace_optimize and self.training and not freeze_codebook:
+
+            if exists(mask):
+                loss = F.mse_loss(quantize, x.detach(), reduction = 'none')
+
+                loss_mask = mask
+                if is_multiheaded:
+                    loss_mask = repeat(mask, 'b n -> c (b h) n', c = loss.shape[0], h = loss.shape[1] // mask.shape[0])
+
+                loss = loss[loss_mask].mean()
+
+            else:
+                loss = F.mse_loss(quantize, x.detach())
+
+            loss.backward()
+            self.in_place_codebook_optimizer.step()
+            self.in_place_codebook_optimizer.zero_grad()
+
+            # quantize again
+
+            quantize, embed_ind, distances = self._codebook(x, **codebook_forward_kwargs)
 
         if self.training:
-            maybe_sync_update = 0.
+            # determine code to use for commitment loss
+            maybe_detach = torch.detach if not self.learnable_codebook or freeze_codebook else identity
+
+            commit_quantize = maybe_detach(quantize)            
+
+            # straight through
+
+            quantize = x + (quantize - x).detach()
 
             if self.sync_update_v > 0.:
                 # (21) in https://minyoungg.github.io/vqtorch/assets/draft_050523.pdf
@@ -852,25 +976,25 @@ class VectorQuantize(nn.Module):
             if self.commitment_weight > 0:
                 if self.commitment_use_cross_entropy_loss:
                     if exists(mask):
+                        ce_loss_mask = mask
                         if is_multiheaded:
-                            mask = repeat(mask, 'b n -> b n h', h = heads)
+                            ce_loss_mask = repeat(ce_loss_mask, 'b n -> b n h', h = heads)
 
-                        embed_ind.masked_fill_(~mask, -1)
+                        embed_ind.masked_fill_(~ce_loss_mask, -1)
 
                     commit_loss = calculate_ce_loss(embed_ind)
                 else:
-                    detached_quantize = quantize.detach()
-
                     if exists(mask):
                         # with variable lengthed sequences
-                        commit_loss = F.mse_loss(detached_quantize, x, reduction = 'none')
+                        commit_loss = F.mse_loss(commit_quantize, x, reduction = 'none')
 
+                        loss_mask = mask
                         if is_multiheaded:
-                            mask = repeat(mask, 'b n -> c (b h) n', c = commit_loss.shape[0], h = commit_loss.shape[1] // mask.shape[0])
+                            loss_mask = repeat(loss_mask, 'b n -> c (b h) n', c = commit_loss.shape[0], h = commit_loss.shape[1] // mask.shape[0])
 
-                        commit_loss = commit_loss[mask].mean()
+                        commit_loss = commit_loss[loss_mask].mean()
                     else:
-                        commit_loss = F.mse_loss(detached_quantize, x)
+                        commit_loss = F.mse_loss(commit_quantize, x)
 
                 loss = loss + commit_loss * self.commitment_weight
 
@@ -915,5 +1039,14 @@ class VectorQuantize(nn.Module):
 
         if only_one:
             quantize = rearrange(quantize, 'b 1 d -> b d')
+
+        # if masking, only return quantized for where mask has True
+
+        if exists(mask):
+            quantize = torch.where(
+                rearrange(mask, '... -> ... 1'),
+                quantize,
+                orig_input
+            )
 
         return quantize, embed_ind, loss
