@@ -193,7 +193,7 @@ def kmeans(
         if use_cosine_sim:
             dists = samples @ rearrange(means, 'h n d -> h d n')
         else:
-            dists = -torch.cdist(samples, means, p = 2)
+            dists = -cdist(samples, means)
 
         buckets = torch.argmax(dists, dim = -1)
         bins = batched_bincount(buckets, minlength = num_clusters)
@@ -732,6 +732,8 @@ class VectorQuantize(nn.Module):
         self.project_in = nn.Linear(dim, codebook_input_dim) if requires_projection else nn.Identity()
         self.project_out = nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
 
+        self.has_projections = requires_projection
+
         self.eps = eps
         self.commitment_weight = commitment_weight
         self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss # whether to use cross entropy loss to codebook as commitment loss
@@ -833,6 +835,10 @@ class VectorQuantize(nn.Module):
         codes = rearrange(codes, 'b h n d -> b n (h d)')
         codes = unpack_one(codes, ps, 'b * d')
         return codes
+
+    def get_output_from_indices(self, indices):
+        codes = self.get_codes_from_indices(indices)
+        return self.project_out(codes)
 
     def forward(
         self,
@@ -966,7 +972,7 @@ class VectorQuantize(nn.Module):
             embed_ind = rearrange(embed_ind, 'b (h w) ... -> b h w ...', h = height, w = width)
 
         if only_one:
-            embed_ind = rearrange(embed_ind, 'b 1 -> b')
+            embed_ind = rearrange(embed_ind, 'b 1 ... -> b ...')
 
         # aggregate loss
 

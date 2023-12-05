@@ -1,4 +1,4 @@
-<img src="./vq.png" width="500px"></img>
+<img src="./images/vq.png" width="500px"></img>
 
 ## Vector Quantization - Pytorch
 
@@ -99,7 +99,7 @@ x = torch.randn(1, 1024, 256)
 
 quantized, indices, commit_loss = residual_vq(x)
 
-# (1, 1024, 256), (1, 1024, 8), (1, 8)
+# (1, 1024, 256), (2, 1, 1024, 8), (2, 1, 8)
 # (batch, seq, dim), (groups, batch, seq, quantizer), (groups, batch, quantizer)
 
 ```
@@ -191,6 +191,7 @@ You can use this feature by simply setting the `orthogonal_reg_weight` to be gre
 ```python
 import torch
 from vector_quantize_pytorch import VectorQuantize
+
 vq = VectorQuantize(
     dim = 256,
     codebook_size = 256,
@@ -199,6 +200,7 @@ vq = VectorQuantize(
     orthogonal_reg_max_codes = 128,             # this would randomly sample from the codebook for the orthogonal regularization loss, for limiting memory usage
     orthogonal_reg_active_codes_only = False    # set this to True if you have a very large codebook, and would only like to enforce the loss on the activated codes per batch
 )
+
 img_fmap = torch.randn(1, 256, 32, 32)
 quantized, indices, loss = vq(img_fmap) # (1, 256, 32, 32), (1, 32, 32), (1,)
 # loss now contains the orthogonal regularization loss with the weight as assigned
@@ -251,11 +253,172 @@ indices = quantizer(x) # (1, 1024, 16) - (batch, seq, num_codebooks)
 
 This repository should also automatically synchronizing the codebooks in a multi-process setting. If somehow it isn't, please open an issue. You can override whether to synchronize codebooks or not by setting `sync_codebook = True | False`
 
-## Todo
+### Finite Scalar Quantization
 
-- [x] allow for multi-headed codebooks
-- [x] support masking
-- [x] make sure affine param works with (`sync_affine_param` set to `True`)
+<img src="./images/fsq.png" width="500px"></img>
+
+|                  | VQ | FSQ |
+|------------------|----|-----|
+| Quantization     | argmin_c \|\| z-c \|\| | round(f(z)) |
+| Gradients        | Straight Through Estimation (STE) | STE |
+| Auxiliary Losses | Commitment, codebook, entropy loss, ... | N/A |
+| Tricks           | EMA on codebook, codebook splitting, projections, ...| N/A |
+| Parameters       | Codebook | N/A |
+
+[This](https://arxiv.org/abs/2309.15505) work out of Google Deepmind aims to vastly simplify the way vector quantization is done for generative modeling, removing the need for commitment losses, EMA updating of the codebook, as well as tackle the issues with codebook collapse or insufficient utilization. They simply round each scalar into discrete levels with straight through gradients; the codes become uniform points in a hypercube.
+
+Thanks goes out to [@sekstini](https://github.com/sekstini) for porting over this implementation in record time!
+
+```python
+import torch
+from vector_quantize_pytorch import FSQ
+
+levels = [8,5,5,5] # see 4.1 and A.4.1 in the paper
+quantizer = FSQ(levels)
+
+x = torch.randn(1, 1024, 4) # 4 since there are 4 levels
+xhat, indices = quantizer(x)
+
+print(xhat.shape)    # (1, 1024, 4) - (batch, seq, dim)
+print(indices.shape) # (1, 1024)    - (batch, seq)
+
+assert xhat.shape == x.shape
+assert torch.all(xhat == quantizer.indices_to_codes(indices))
+```
+
+An improvised Residual FSQ, for an attempt to improve audio encoding. 
+
+Credit goes to [@sekstini](https://github.com/sekstini) for originally incepting the idea [here](https://github.com/lucidrains/vector-quantize-pytorch/pull/74#issuecomment-1742048597)
+
+```python
+import torch
+from vector_quantize_pytorch import ResidualFSQ
+
+residual_fsq = ResidualFSQ(
+    dim = 256,
+    levels = [8, 5, 5, 3],
+    num_quantizers = 8
+)
+
+x = torch.randn(1, 1024, 256)
+
+residual_fsq.eval()
+
+quantized, indices = residual_fsq(x)
+
+# (1, 1024, 256), (1, 1024, 8), (8)
+# (batch, seq, dim), (batch, seq, quantizers), (quantizers)
+
+quantized_out = residual_fsq.get_output_from_indices(indices)
+
+# (8, 1, 1024, 8)
+# (residual layers, batch, seq, quantizers)
+
+assert torch.all(quantized == quantized_out)
+```
+
+### Lookup Free Quantization
+
+<img src="./images/lfq.png" width="450px"></img>
+
+The research team behind <a href="https://arxiv.org/abs/2212.05199">MagViT</a> has released new SOTA results for generative video modeling. A core change between v1 and v2 include a new type of quantization, look-up free quantization (LFQ), which eliminates the codebook and embedding lookup entirely.
+
+This paper presents a simple LFQ quantizer of using independent binary latents. Other implementations of LFQ exist. However, the team shows that MAGVIT-v2 with LFQ significantly improves on the ImageNet benchmark. The differences between LFQ and 2-level FSQ includes entropy regularizations as well as maintained commitment loss.
+
+Developing a more advanced method of LFQ quantization without codebook-lookup could revolutionize generative modeling.
+
+You can use it simply as follows. Will be dogfooded at <a href="https://github.com/lucidrains/magvit2-pytorch">MagViT2 pytorch port</a>
+
+```python
+import torch
+from vector_quantize_pytorch import LFQ
+
+# you can specify either dim or codebook_size
+# if both specified, will be validated against each other
+
+quantizer = LFQ(
+    codebook_size = 65536,      # codebook size, must be a power of 2
+    dim = 16,                   # this is the input feature dimension, defaults to log2(codebook_size) if not defined
+    entropy_loss_weight = 0.1,  # how much weight to place on entropy loss
+    diversity_gamma = 1.        # within entropy loss, how much weight to give to diversity of codes, taken from https://arxiv.org/abs/1911.05894
+)
+
+image_feats = torch.randn(1, 16, 32, 32)
+
+quantized, indices, entropy_aux_loss = quantizer(image_feats)
+
+# (1, 16, 32, 32), (1, 32, 32), (1,)
+
+assert image_feats.shape == quantized.shape
+assert (quantized == quantizer.indices_to_codes(indices)).all()
+```
+
+You can also pass in video features as `(batch, feat, time, height, width)` or sequences as `(batch, seq, feat)`
+
+```python
+
+seq = torch.randn(1, 32, 16)
+quantized, *_ = quantizer(seq)
+
+assert seq.shape == quantized.shape
+
+video_feats = torch.randn(1, 16, 10, 32, 32)
+quantized, *_ = quantizer(video_feats)
+
+assert video_feats.shape == quantized.shape
+
+```
+
+Or support multiple codebooks
+
+```python
+import torch
+from vector_quantize_pytorch import LFQ
+
+quantizer = LFQ(
+    codebook_size = 4096,
+    dim = 16,
+    num_codebooks = 4  # 4 codebooks, total codebook dimension is log2(4096) * 4
+)
+
+image_feats = torch.randn(1, 16, 32, 32)
+
+quantized, indices, entropy_aux_loss = quantizer(image_feats)
+
+# (1, 16, 32, 32), (1, 32, 32, 4), (1,)
+
+assert image_feats.shape == quantized.shape
+assert (quantized == quantizer.indices_to_codes(indices)).all()
+```
+
+An improvised Residual LFQ, to see if it can lead to an improvement for audio compression.
+
+```python
+import torch
+from vector_quantize_pytorch import ResidualLFQ
+
+residual_lfq = ResidualLFQ(
+    dim = 256,
+    codebook_size = 256,
+    num_quantizers = 8
+)
+
+x = torch.randn(1, 1024, 256)
+
+residual_lfq.eval()
+
+quantized, indices, commit_loss = residual_lfq(x)
+
+# (1, 1024, 256), (1, 1024, 8), (8)
+# (batch, seq, dim), (batch, seq, quantizers), (quantizers)
+
+quantized_out = residual_lfq.get_output_from_indices(indices)
+
+# (8, 1, 1024, 8)
+# (residual layers, batch, seq, quantizers)
+
+assert torch.all(quantized == quantized_out)
+```
 
 ## Citations
 
@@ -380,6 +543,28 @@ This repository should also automatically synchronizing the codebooks in a multi
     author  = {Woncheol Shin and Gyubok Lee and Jiyoung Lee and Joonseok Lee and Edward Choi},
     year    = {2021},
     eprint  = {2112.00384},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@misc{mentzer2023finite,
+    title   = {Finite Scalar Quantization: VQ-VAE Made Simple},
+    author  = {Fabian Mentzer and David Minnen and Eirikur Agustsson and Michael Tschannen},
+    year    = {2023},
+    eprint  = {2309.15505},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@misc{yu2023language,
+    title   = {Language Model Beats Diffusion -- Tokenizer is Key to Visual Generation},
+    author  = {Lijun Yu and José Lezama and Nitesh B. Gundavarapu and Luca Versari and Kihyuk Sohn and David Minnen and Yong Cheng and Agrim Gupta and Xiuye Gu and Alexander G. Hauptmann and Boqing Gong and Ming-Hsuan Yang and Irfan Essa and David A. Ross and Lu Jiang},
+    year    = {2023},
+    eprint  = {2310.05737},
     archivePrefix = {arXiv},
     primaryClass = {cs.CV}
 }

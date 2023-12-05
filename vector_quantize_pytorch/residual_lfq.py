@@ -1,12 +1,14 @@
 import random
-from math import ceil
+from math import log2
 from functools import partial
-from itertools import zip_longest
 
 import torch
 from torch import nn
+from torch.nn import Module, ModuleList
 import torch.nn.functional as F
-from vector_quantize_pytorch.vector_quantize_pytorch import VectorQuantize
+from torch.cuda.amp import autocast
+
+from vector_quantize_pytorch.lookup_free_quantization import LFQ
 
 from einops import rearrange, repeat, reduce, pack, unpack
 
@@ -23,38 +25,44 @@ def round_up_multiple(num, mult):
 
 # main class
 
-class ResidualVQ(nn.Module):
+class ResidualLFQ(Module):
     """ Follows Algorithm 1. in https://arxiv.org/pdf/2107.03312.pdf """
+
     def __init__(
         self,
         *,
         dim,
         num_quantizers,
-        codebook_dim = None,
-        shared_codebook = False,
-        heads = 1,
+        codebook_size,
         quantize_dropout = False,
         quantize_dropout_cutoff_index = 0,
         quantize_dropout_multiple_of = 1,
-        accept_image_fmap = False,
         **kwargs
     ):
         super().__init__()
-        assert heads == 1, 'residual vq is not compatible with multi-headed codes'
-        codebook_dim = default(codebook_dim, dim)
-        codebook_input_dim = codebook_dim * heads
+        codebook_dim = int(log2(codebook_size))
 
-        requires_projection = codebook_input_dim != dim
-        self.project_in = nn.Linear(dim, codebook_input_dim) if requires_projection else nn.Identity()
-        self.project_out = nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
+        requires_projection = codebook_dim != dim
+        self.project_in = nn.Linear(dim, codebook_dim) if requires_projection else nn.Identity()
+        self.project_out = nn.Linear(codebook_dim, dim) if requires_projection else nn.Identity()
         self.has_projections = requires_projection
 
         self.num_quantizers = num_quantizers
 
-        self.accept_image_fmap = accept_image_fmap
-        self.layers = nn.ModuleList([VectorQuantize(dim = codebook_dim, codebook_dim = codebook_dim, accept_image_fmap = accept_image_fmap, **kwargs) for _ in range(num_quantizers)])
+        self.layers = nn.ModuleList([])
 
-        assert all([not vq.has_projections for vq in self.layers])
+        for ind in range(num_quantizers):
+            codebook_scale = 2 ** -ind
+
+            lfq = LFQ(
+                dim = codebook_dim,
+                codebook_scale = codebook_scale,
+                **kwargs
+            )
+
+            self.layers.append(lfq)
+
+        assert all([not lfq.has_projections for lfq in self.layers])
 
         self.quantize_dropout = quantize_dropout and num_quantizers > 1
 
@@ -63,20 +71,10 @@ class ResidualVQ(nn.Module):
         self.quantize_dropout_cutoff_index = quantize_dropout_cutoff_index
         self.quantize_dropout_multiple_of = quantize_dropout_multiple_of  # encodec paper proposes structured dropout, believe this was set to 4
 
-        if not shared_codebook:
-            return
-
-        first_vq, *rest_vq = self.layers
-        codebook = first_vq._codebook
-
-        for vq in rest_vq:
-            vq._codebook = codebook
-
     @property
     def codebooks(self):
-        codebooks = [layer._codebook.embed for layer in self.layers]
+        codebooks = [layer.codebook for layer in self.layers]
         codebooks = torch.stack(codebooks, dim = 0)
-        codebooks = rearrange(codebooks, 'q 1 c d -> q c d')
         return codebooks
 
     def get_codes_from_indices(self, indices):
@@ -124,16 +122,12 @@ class ResidualVQ(nn.Module):
     def forward(
         self,
         x,
-        indices = None,
         return_all_codes = False,
-        sample_codebook_temp = None,
         rand_quantize_dropout_fixed_seed = None
     ):
-        num_quant, quant_dropout_multiple_of, return_loss, device = self.num_quantizers, self.quantize_dropout_multiple_of, exists(indices), x.device
+        num_quant, quant_dropout_multiple_of, device = self.num_quantizers, self.quantize_dropout_multiple_of, x.device
 
         x = self.project_in(x)
-
-        assert not (self.accept_image_fmap and exists(indices))
 
         quantized_out = 0.
         residual = x
@@ -141,11 +135,7 @@ class ResidualVQ(nn.Module):
         all_losses = []
         all_indices = []
 
-        if return_loss:
-            assert not torch.any(indices == -1), 'some of the residual vq indices were dropped out. please use indices derived when the module is in eval mode to derive cross entropy loss'
-            ce_losses = []
-
-        should_quantize_dropout = self.training and self.quantize_dropout and not return_loss
+        should_quantize_dropout = self.training and self.quantize_dropout
 
         # sample a layer index at which to dropout further residual quantization
         # also prepare null indices and loss
@@ -158,46 +148,30 @@ class ResidualVQ(nn.Module):
             if quant_dropout_multiple_of != 1:
                 rand_quantize_dropout_index = round_up_multiple(rand_quantize_dropout_index + 1, quant_dropout_multiple_of) - 1
 
-            null_indices_shape = (x.shape[0], *x.shape[-2:]) if self.accept_image_fmap else tuple(x.shape[:2])
-            null_indices = torch.full(null_indices_shape, -1., device = device, dtype = torch.long)
-            null_loss = torch.full((1,), 0., device = device, dtype = x.dtype)
+            null_indices = torch.full(x.shape[:2], -1., device = device, dtype = torch.long)
+            null_loss = torch.tensor(0., device = device, dtype = x.dtype)
 
         # go through the layers
 
-        for quantizer_index, layer in enumerate(self.layers):
+        with autocast(enabled = False):
+            for quantizer_index, layer in enumerate(self.layers):
 
-            if should_quantize_dropout and quantizer_index > rand_quantize_dropout_index:
-                all_indices.append(null_indices)
-                all_losses.append(null_loss)
-                continue
+                if should_quantize_dropout and quantizer_index > rand_quantize_dropout_index:
+                    all_indices.append(null_indices)
+                    all_losses.append(null_loss)
+                    continue
 
-            layer_indices = None
-            if return_loss:
-                layer_indices = indices[..., quantizer_index]
+                quantized, indices, loss = layer(residual)
 
-            quantized, *rest = layer(residual, indices = layer_indices, sample_codebook_temp = sample_codebook_temp)
+                residual = residual - quantized.detach()
+                quantized_out = quantized_out + quantized
 
-            residual = residual - quantized.detach()
-            quantized_out = quantized_out + quantized
-
-            if return_loss:
-                ce_loss = rest[0]
-                ce_losses.append(ce_loss)
-                continue
-
-            embed_indices, loss = rest
-
-            all_indices.append(embed_indices)
-            all_losses.append(loss)
+                all_indices.append(indices)
+                all_losses.append(loss)
 
         # project out, if needed
 
         quantized_out = self.project_out(quantized_out)
-
-        # whether to early return the cross entropy loss
-
-        if return_loss:
-            return quantized_out, sum(ce_losses)
 
         # stack all losses and indices
 
@@ -205,18 +179,20 @@ class ResidualVQ(nn.Module):
 
         ret = (quantized_out, all_indices, all_losses)
 
-        if return_all_codes:
-            # whether to return all codes from all codebooks across layers
-            all_codes = self.get_codes_from_indices(all_indices)
+        if not return_all_codes:
+            return ret
 
-            # will return all codes in shape (quantizer, batch, sequence length, codebook dimension)
-            ret = (*ret, all_codes)
+        # whether to return all codes from all codebooks across layers
 
-        return ret
+        all_codes = self.get_codes_from_indices(all_indices)
 
-# grouped residual vq
+        # will return all codes in shape (quantizer, batch, sequence length, codebook dimension)
 
-class GroupedResidualVQ(nn.Module):
+        return (*ret, all_codes)
+
+# grouped residual lfq
+
+class GroupedResidualLFQ(Module):
     def __init__(
         self,
         *,
@@ -236,9 +212,8 @@ class GroupedResidualVQ(nn.Module):
         self.rvqs = nn.ModuleList([])
 
         for _ in range(groups):
-            self.rvqs.append(ResidualVQ(
+            self.rvqs.append(ResidualLFQ(
                 dim = dim_per_group,
-                accept_image_fmap = accept_image_fmap,
                 **kwargs
             ))
 
@@ -261,9 +236,7 @@ class GroupedResidualVQ(nn.Module):
     def forward(
         self,
         x,
-        indices = None,
-        return_all_codes = False,
-        sample_codebook_temp = None
+        return_all_codes = False
     ):
         shape, split_dim = x.shape, self.split_dim
         assert shape[split_dim] == self.dim
@@ -272,26 +245,15 @@ class GroupedResidualVQ(nn.Module):
 
         x = x.chunk(self.groups, dim = split_dim)
 
-        indices = default(indices, tuple())
-        return_ce_loss = len(indices) > 0
-        assert len(indices) == 0 or len(indices) == self.groups
-
         forward_kwargs = dict(
             return_all_codes = return_all_codes,
-            sample_codebook_temp = sample_codebook_temp,
             rand_quantize_dropout_fixed_seed = random.randint(0, 1e7)
         )
 
         # invoke residual vq on each group
 
-        out = tuple(rvq(chunk, indices = chunk_indices, **forward_kwargs) for rvq, chunk, chunk_indices in zip_longest(self.rvqs, x, indices))
+        out = tuple(rvq(chunk, **forward_kwargs) for rvq, chunk in zip(self.rvqs, x))
         out = tuple(zip(*out))
-
-        # if returning cross entropy loss to rvq codebooks
-
-        if return_ce_loss:
-            quantized, ce_losses = out
-            return torch.cat(quantized, dim = split_dim), sum(ce_losses)
 
         # otherwise, get all the zipped outputs and combine them
 
