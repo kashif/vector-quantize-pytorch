@@ -1,16 +1,19 @@
 import random
 from math import log2
-from functools import partial
+from functools import partial, cache
 
 import torch
 from torch import nn
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
+import torch.distributed as dist
 
 from vector_quantize_pytorch.lookup_free_quantization import LFQ
 
 from einops import rearrange, repeat, reduce, pack, unpack
+
+from einx import get_at
 
 # helper functions
 
@@ -22,6 +25,19 @@ def default(val, d):
 
 def round_up_multiple(num, mult):
     return ceil(num / mult) * mult
+
+# distributed helpers
+
+def is_distributed():
+    return dist.is_initialized() and dist.get_world_size() > 1
+
+def get_maybe_sync_seed(device, max_size = 10_000):
+    rand_int = torch.randint(0, max_size, (), device = device)
+
+    if is_distributed():
+        dist.all_reduce(rand_int)
+
+    return rand_int.item()
 
 # main class
 
@@ -37,6 +53,7 @@ class ResidualLFQ(Module):
         quantize_dropout = False,
         quantize_dropout_cutoff_index = 0,
         quantize_dropout_multiple_of = 1,
+        soft_clamp_input_value = None,
         **kwargs
     ):
         super().__init__()
@@ -57,10 +74,14 @@ class ResidualLFQ(Module):
             lfq = LFQ(
                 dim = codebook_dim,
                 codebook_scale = codebook_scale,
+                soft_clamp_input_value = soft_clamp_input_value,
                 **kwargs
             )
 
             self.layers.append(lfq)
+
+            if exists(soft_clamp_input_value):
+                soft_clamp_input_value *= 0.5
 
         assert all([not lfq.has_projections for lfq in self.layers])
 
@@ -92,21 +113,16 @@ class ResidualLFQ(Module):
             assert self.quantize_dropout > 0., 'quantize dropout must be greater than 0 if you wish to reconstruct from a signal with less fine quantizations'
             indices = F.pad(indices, (0, self.num_quantizers - quantize_dim), value = -1)
 
-        # get ready for gathering
-
-        codebooks = repeat(self.codebooks, 'q c d -> q b c d', b = batch)
-        gather_indices = repeat(indices, 'b n q -> q b n d', d = codebooks.shape[-1])
-
         # take care of quantizer dropout
 
-        mask = gather_indices == -1.
-        gather_indices = gather_indices.masked_fill(mask, 0) # have it fetch a dummy code to be masked out later
+        mask = indices == -1.
+        indices = indices.masked_fill(mask, 0) # have it fetch a dummy code to be masked out later
 
-        all_codes = codebooks.gather(2, gather_indices) # gather all codes
+        all_codes = get_at('q [c] d, b n q -> q b n d', self.codebooks, indices)
 
         # mask out any codes that were dropout-ed
 
-        all_codes = all_codes.masked_fill(mask, 0.)
+        all_codes = all_codes.masked_fill(rearrange(mask, 'b n q -> q b n 1'), 0.)
 
         # if (accept_image_fmap = True) then return shape (quantize, batch, height, width, dimension)
 
@@ -122,6 +138,7 @@ class ResidualLFQ(Module):
     def forward(
         self,
         x,
+        mask = None,
         return_all_codes = False,
         rand_quantize_dropout_fixed_seed = None
     ):
@@ -141,7 +158,13 @@ class ResidualLFQ(Module):
         # also prepare null indices and loss
 
         if should_quantize_dropout:
-            rand = random.Random(rand_quantize_dropout_fixed_seed) if exists(rand_quantize_dropout_fixed_seed) else random
+
+            # check if seed is manually passed in
+
+            if not exists(rand_quantize_dropout_fixed_seed):
+                rand_quantize_dropout_fixed_seed = get_maybe_sync_seed(device)
+
+            rand = random.Random(rand_quantize_dropout_fixed_seed)
 
             rand_quantize_dropout_index = rand.randrange(self.quantize_dropout_cutoff_index, num_quant)
 
@@ -153,7 +176,7 @@ class ResidualLFQ(Module):
 
         # go through the layers
 
-        with autocast(enabled = False):
+        with autocast('cuda', enabled = False):
             for quantizer_index, layer in enumerate(self.layers):
 
                 if should_quantize_dropout and quantizer_index > rand_quantize_dropout_index:
@@ -161,7 +184,7 @@ class ResidualLFQ(Module):
                     all_losses.append(null_loss)
                     continue
 
-                quantized, indices, loss = layer(residual)
+                quantized, indices, loss = layer(residual, mask = mask)
 
                 residual = residual - quantized.detach()
                 quantized_out = quantized_out + quantized
@@ -236,9 +259,10 @@ class GroupedResidualLFQ(Module):
     def forward(
         self,
         x,
+        mask = None,
         return_all_codes = False
     ):
-        shape, split_dim = x.shape, self.split_dim
+        shape, split_dim, device = x.shape, self.split_dim, x.device
         assert shape[split_dim] == self.dim
 
         # split the feature dimension into groups
@@ -246,8 +270,9 @@ class GroupedResidualLFQ(Module):
         x = x.chunk(self.groups, dim = split_dim)
 
         forward_kwargs = dict(
+            mask = mask,
             return_all_codes = return_all_codes,
-            rand_quantize_dropout_fixed_seed = random.randint(0, 1e7)
+            rand_quantize_dropout_fixed_seed = get_maybe_sync_seed(device) if self.training else None
         )
 
         # invoke residual vq on each group

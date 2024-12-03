@@ -8,22 +8,41 @@ import torch
 from torch import nn
 from torch.nn import Module, ModuleList
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
+import torch.distributed as dist
 
 from vector_quantize_pytorch.finite_scalar_quantization import FSQ
 
 from einops import rearrange, repeat, reduce, pack, unpack
+
+from einx import get_at
 
 # helper functions
 
 def exists(val):
     return val is not None
 
+def first(l):
+    return l[0]
+
 def default(val, d):
     return val if exists(val) else d
 
 def round_up_multiple(num, mult):
     return ceil(num / mult) * mult
+
+# distributed helpers
+
+def is_distributed():
+    return dist.is_initialized() and dist.get_world_size() > 1
+
+def get_maybe_sync_seed(device, max_size = 10_000):
+    rand_int = torch.randint(0, max_size, (), device = device)
+
+    if is_distributed():
+        dist.all_reduce(rand_int)
+
+    return rand_int.item()
 
 # main class
 
@@ -33,9 +52,10 @@ class ResidualFSQ(Module):
     def __init__(
         self,
         *,
-        dim,
         levels: List[int],
         num_quantizers,
+        dim = None,
+        is_channel_first = False,
         quantize_dropout = False,
         quantize_dropout_cutoff_index = 0,
         quantize_dropout_multiple_of = 1,
@@ -43,12 +63,14 @@ class ResidualFSQ(Module):
     ):
         super().__init__()
         codebook_dim = len(levels)
+        dim = default(dim, codebook_dim)
 
         requires_projection = codebook_dim != dim
         self.project_in = nn.Linear(dim, codebook_dim) if requires_projection else nn.Identity()
         self.project_out = nn.Linear(codebook_dim, dim) if requires_projection else nn.Identity()
         self.has_projections = requires_projection
 
+        self.is_channel_first = is_channel_first
         self.num_quantizers = num_quantizers
 
         self.levels = levels
@@ -59,7 +81,7 @@ class ResidualFSQ(Module):
         scales = []
 
         for ind in range(num_quantizers):
-            scales.append(levels_tensor ** -ind)
+            scales.append((levels_tensor - 1) ** -ind)
 
             fsq = FSQ(
                 levels = levels,
@@ -103,21 +125,16 @@ class ResidualFSQ(Module):
             assert self.quantize_dropout > 0., 'quantize dropout must be greater than 0 if you wish to reconstruct from a signal with less fine quantizations'
             indices = F.pad(indices, (0, self.num_quantizers - quantize_dim), value = -1)
 
-        # get ready for gathering
-
-        codebooks = repeat(self.codebooks, 'q c d -> q b c d', b = batch)
-        gather_indices = repeat(indices, 'b n q -> q b n d', d = codebooks.shape[-1])
-
         # take care of quantizer dropout
 
-        mask = gather_indices == -1.
-        gather_indices = gather_indices.masked_fill(mask, 0) # have it fetch a dummy code to be masked out later
+        mask = indices == -1
+        indices = indices.masked_fill(mask, 0) # have it fetch a dummy code to be masked out later
 
-        all_codes = codebooks.gather(2, gather_indices.long()) # gather all codes
+        all_codes = get_at('q [c] d, b n q -> q b n d', self.codebooks, indices)
 
         # mask out any codes that were dropout-ed
 
-        all_codes = all_codes.masked_fill(mask, 0.)
+        all_codes = all_codes.masked_fill(rearrange(mask, 'b n q -> q b n 1'), 0.)
 
         # scale the codes
 
@@ -143,6 +160,14 @@ class ResidualFSQ(Module):
     ):
         num_quant, quant_dropout_multiple_of, device = self.num_quantizers, self.quantize_dropout_multiple_of, x.device
 
+        # handle channel first
+
+        if self.is_channel_first:
+            x = rearrange(x, 'b d ... -> b ... d')
+            x, ps = pack([x], 'b * d')
+
+        # maybe project in
+
         x = self.project_in(x)
 
         quantized_out = 0.
@@ -156,7 +181,13 @@ class ResidualFSQ(Module):
         # also prepare null indices
 
         if should_quantize_dropout:
-            rand = random.Random(rand_quantize_dropout_fixed_seed) if exists(rand_quantize_dropout_fixed_seed) else random
+
+            # check if seed is manually passed in
+
+            if not exists(rand_quantize_dropout_fixed_seed):
+                rand_quantize_dropout_fixed_seed = get_maybe_sync_seed(device)
+
+            rand = random.Random(rand_quantize_dropout_fixed_seed)
 
             rand_quantize_dropout_index = rand.randrange(self.quantize_dropout_cutoff_index, num_quant)
 
@@ -167,7 +198,7 @@ class ResidualFSQ(Module):
 
         # go through the layers
 
-        with autocast(enabled = False):
+        with autocast('cuda', enabled = False):
             for quantizer_index, (layer, scale) in enumerate(zip(self.layers, self.scales)):
 
                 if should_quantize_dropout and quantizer_index > rand_quantize_dropout_index:
@@ -175,6 +206,7 @@ class ResidualFSQ(Module):
                     continue
 
                 quantized, indices = layer(residual / scale)
+
                 quantized = quantized * scale
 
                 residual = residual - quantized.detach()
@@ -189,6 +221,17 @@ class ResidualFSQ(Module):
         # stack all indices
 
         all_indices = torch.stack(all_indices, dim = -1)
+
+        # channel first out
+
+        if self.is_channel_first:
+            quantized_out, = unpack(quantized_out, ps, 'b * d')
+            all_indices, = unpack(all_indices, ps, 'b * d')
+
+            quantized_out = rearrange(quantized_out, 'b ... d -> b d ...')
+            all_indices = rearrange(all_indices, 'b ... d -> b d ...')
+
+        # return
 
         ret = (quantized_out, all_indices)
 
@@ -253,7 +296,7 @@ class GroupedResidualFSQ(Module):
         x,
         return_all_codes = False
     ):
-        shape, split_dim = x.shape, self.split_dim
+        shape, split_dim, device = x.shape, self.split_dim, x.device
         assert shape[split_dim] == self.dim
 
         # split the feature dimension into groups
@@ -262,7 +305,7 @@ class GroupedResidualFSQ(Module):
 
         forward_kwargs = dict(
             return_all_codes = return_all_codes,
-            rand_quantize_dropout_fixed_seed = random.randint(0, 1e7)
+            rand_quantize_dropout_fixed_seed = get_maybe_sync_seed(device) if self.training else None
         )
 
         # invoke residual vq on each group

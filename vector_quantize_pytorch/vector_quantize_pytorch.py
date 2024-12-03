@@ -1,12 +1,17 @@
-from functools import partial
+from __future__ import annotations
+
+from functools import partial, cache
+from collections import namedtuple
 
 import torch
-from torch import nn, einsum
+from torch.nn import Module
+from torch import nn, einsum, Tensor
 import torch.nn.functional as F
 import torch.distributed as distributed
 from torch.optim import Optimizer
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
+import einx
 from einops import rearrange, repeat, reduce, pack, unpack
 
 from typing import Callable
@@ -23,17 +28,32 @@ def noop(*args, **kwargs):
 def identity(t):
     return t
 
-def l2norm(t):
-    return F.normalize(t, p = 2, dim = -1)
+def l2norm(t, dim = -1,  eps = 1e-6):
+    return F.normalize(t, p = 2, dim = dim, eps = eps)
+
+def safe_div(num, den, eps = 1e-6):
+    return num / den.clamp(min = eps)
+
+def Sequential(*modules):
+    modules = [*filter(exists, modules)]
+    if len(modules) == 0:
+        return None
+    elif len(modules) == 1:
+        return modules[0]
+
+    return nn.Sequential(*modules)
 
 def cdist(x, y):
     x2 = reduce(x ** 2, 'b n d -> b n', 'sum')
     y2 = reduce(y ** 2, 'b n d -> b n', 'sum')
     xy = einsum('b i d, b j d -> b i j', x, y) * -2
-    return (rearrange(x2, 'b i -> b i 1') + rearrange(y2, 'b j -> b 1 j') + xy).sqrt()
+    return (rearrange(x2, 'b i -> b i 1') + rearrange(y2, 'b j -> b 1 j') + xy).clamp(min = 0).sqrt()
 
 def log(t, eps = 1e-20):
     return torch.log(t.clamp(min = eps))
+
+def entropy(prob, eps = 1e-5):
+    return (-prob * log(prob, eps = eps)).sum(dim = -1)
 
 def ema_inplace(old, new, decay):
     is_mps = str(old.device).startswith('mps:')
@@ -44,10 +64,17 @@ def ema_inplace(old, new, decay):
         old.mul_(decay).add_(new * (1 - decay))
 
 def pack_one(t, pattern):
-    return pack([t], pattern)
+    packed, ps = pack([t], pattern)
 
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
+    def unpack_one(to_unpack, unpack_pattern = None):
+        unpacked, = unpack(to_unpack, ps, default(unpack_pattern, pattern))
+        return unpacked
+
+    return packed, unpack_one
+
+def lens_to_mask(lens, max_length):
+    seq = torch.arange(max_length, device = lens.device)
+    return seq < lens[:, None]
 
 def uniform_init(*shape):
     t = torch.empty(shape)
@@ -63,7 +90,6 @@ def gumbel_sample(
     temperature = 1.,
     stochastic = False,
     straight_through = False,
-    reinmax = False,
     dim = -1,
     training = True
 ):
@@ -77,23 +103,11 @@ def gumbel_sample(
     ind = sampling_logits.argmax(dim = dim)
     one_hot = F.one_hot(ind, size).type(dtype)
 
-    assert not (reinmax and not straight_through), 'reinmax can only be turned on if using straight through gumbel softmax'
-
     if not straight_through or temperature <= 0. or not training:
         return ind, one_hot
 
-    # use reinmax for better second-order accuracy - https://arxiv.org/abs/2304.08612
-    # algorithm 2
-
-    if reinmax:
-        π0 = logits.softmax(dim = dim)
-        π1 = (one_hot + (logits / temperature).softmax(dim = dim)) / 2
-        π1 = ((log(π1) - logits).detach() + logits).softmax(dim = 1)
-        π2 = 2 * π1 - 0.5 * π0
-        one_hot = π2 - π2.detach() + one_hot
-    else:
-        π1 = (logits / temperature).softmax(dim = dim)
-        one_hot = one_hot + π1 - π1.detach()
+    π1 = (logits / temperature).softmax(dim = dim)
+    one_hot = one_hot + π1 - π1.detach()
 
     return ind, one_hot
 
@@ -129,6 +143,8 @@ def sample_multinomial(total_count, probs):
         sample[i] = s
         total_count -= s
         remainder -= p
+
+    assert total_count == 0, f'invalid total count {total_count}'
 
     return sample.to(device)
 
@@ -219,11 +235,44 @@ def kmeans(
 
     return means, bins
 
-def batched_embedding(indices, embeds):
-    batch, dim = indices.shape[1], embeds.shape[-1]
-    indices = repeat(indices, 'h b n -> h b n d', d = dim)
-    embeds = repeat(embeds, 'h c d -> h b c d', b = batch)
-    return embeds.gather(2, indices)
+# rotation trick related
+
+def efficient_rotation_trick_transform(u, q, e):
+    """
+    4.2 in https://arxiv.org/abs/2410.06424
+    """
+    e = rearrange(e, 'b d -> b 1 d')
+    w = l2norm(u + q, dim = 1).detach()
+
+    return (
+        e -
+        2 * (e @ rearrange(w, 'b d -> b d 1') @ rearrange(w, 'b d -> b 1 d')) +
+        2 * (e @ rearrange(u, 'b d -> b d 1').detach() @ rearrange(q, 'b d -> b 1 d').detach())
+    )
+
+def rotate_to(src, tgt):
+    # rotation trick STE (https://arxiv.org/abs/2410.06424) to get gradients through VQ layer.
+    src, inverse = pack_one(src, '* d')
+    tgt, _ = pack_one(tgt, '* d')
+
+    norm_src = src.norm(dim = -1, keepdim = True)
+    norm_tgt = tgt.norm(dim = -1, keepdim = True)
+
+    rotated_tgt = efficient_rotation_trick_transform(
+        safe_div(src, norm_src),
+        safe_div(tgt, norm_tgt),
+        src
+    ).squeeze()
+
+    rotated = rotated_tgt * safe_div(norm_tgt, norm_src).detach()
+
+    return inverse(rotated)
+
+# distributed helpers
+
+@cache
+def is_distributed():
+    return distributed.is_initialized() and distributed.get_world_size() > 1
 
 # regularization losses
 
@@ -236,7 +285,7 @@ def orthogonal_loss_fn(t):
 
 # distance types
 
-class EuclideanCodebook(nn.Module):
+class EuclideanCodebook(Module):
     def __init__(
         self,
         dim,
@@ -254,6 +303,7 @@ class EuclideanCodebook(nn.Module):
         gumbel_sample = gumbel_sample,
         sample_codebook_temp = 1.,
         ema_update = True,
+        manual_ema_update = False,
         affine_param = False,
         sync_affine_param = False,
         affine_param_batch_decay = 0.99,
@@ -264,6 +314,7 @@ class EuclideanCodebook(nn.Module):
 
         self.decay = decay
         self.ema_update = ema_update
+        self.manual_ema_update = manual_ema_update
 
         init_fn = uniform_init if not kmeans_init else torch.zeros
         embed = init_fn(num_codebooks, codebook_size, dim)
@@ -283,11 +334,14 @@ class EuclideanCodebook(nn.Module):
         assert not (use_ddp and num_codebooks > 1 and kmeans_init), 'kmeans init is not compatible with multiple codebooks in distributed environment for now'
 
         self.sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
+        self.replace_sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
         self.kmeans_all_reduce_fn = distributed.all_reduce if use_ddp and sync_kmeans else noop
         self.all_reduce_fn = distributed.all_reduce if use_ddp else noop
 
         self.register_buffer('initted', torch.Tensor([not kmeans_init]))
-        self.register_buffer('cluster_size', torch.zeros(num_codebooks, codebook_size))
+        self.register_buffer('cluster_size', torch.ones(num_codebooks, codebook_size))
         self.register_buffer('embed_avg', embed.clone())
 
         self.learnable_codebook = learnable_codebook
@@ -409,15 +463,11 @@ class EuclideanCodebook(nn.Module):
         self.update_with_decay('batch_variance', batch_variance, self.affine_param_batch_decay)
 
     def replace(self, batch_samples, batch_mask):
-        for ind, (samples, mask) in enumerate(zip(batch_samples.unbind(dim = 0), batch_mask.unbind(dim = 0))):
-            if not torch.any(mask):
-                continue
-
-            sampled = self.sample_fn(rearrange(samples, '... -> 1 ...'), mask.sum().item())
+        for ind, (samples, mask) in enumerate(zip(batch_samples, batch_mask)):
+            sampled = self.replace_sample_fn(rearrange(samples, '... -> 1 ...'), mask.sum().item())
             sampled = rearrange(sampled, '1 ... -> ...')
-            
-            self.embed.data[ind][mask] = sampled
 
+            self.embed.data[ind][mask] = sampled
             self.cluster_size.data[ind][mask] = self.reset_cluster_size
             self.embed_avg.data[ind][mask] = sampled * self.reset_cluster_size
 
@@ -433,13 +483,20 @@ class EuclideanCodebook(nn.Module):
         batch_samples = rearrange(batch_samples, 'h ... d -> h (...) d')
         self.replace(batch_samples, batch_mask = expired_codes)
 
-    @autocast(enabled = False)
+    def update_ema(self):
+        cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
+
+        embed_normalized = self.embed_avg / rearrange(cluster_size, '... -> ... 1')
+        self.embed.data.copy_(embed_normalized)
+
+    @autocast('cuda', enabled = False)
     def forward(
         self,
         x,
         sample_codebook_temp = None,
         mask = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        codebook_transform_fn: Callable | None = None
     ):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -450,7 +507,7 @@ class EuclideanCodebook(nn.Module):
             x = rearrange(x, '... -> 1 ...')
 
         dtype = x.dtype
-        flatten, ps = pack_one(x, 'h * d')
+        flatten, unpack_one = pack_one(x, 'h * d')
 
         if exists(mask):
             mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
@@ -460,24 +517,51 @@ class EuclideanCodebook(nn.Module):
         if self.affine_param:
             self.update_affine(flatten, self.embed, mask = mask)
 
-        embed = self.embed if self.learnable_codebook else self.embed.detach()
+        # affine params
 
         if self.affine_param:
             codebook_std = self.codebook_variance.clamp(min = 1e-5).sqrt()
             batch_std = self.batch_variance.clamp(min = 1e-5).sqrt()
             embed = (embed - self.codebook_mean) * (batch_std / codebook_std) + self.batch_mean
 
-        dist = -cdist(flatten, embed)
+        # get maybe learnable codes
+
+        embed = self.embed if self.learnable_codebook else self.embed.detach()
+
+        # handle maybe implicit neural codebook
+        # and calculate distance
+
+        if exists(codebook_transform_fn):
+            transformed_embed = codebook_transform_fn(embed)
+            transformed_embed = rearrange(transformed_embed, 'h b n c d -> h (b n) c d')
+            broadcastable_input = rearrange(flatten, '... d -> ... 1 d')
+
+            dist = -F.pairwise_distance(broadcastable_input, transformed_embed)
+        else:
+            dist = -cdist(flatten, embed)
+
+        # sample or argmax depending on temperature
 
         embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
 
-        embed_ind = unpack_one(embed_ind, ps, 'h *')
+        embed_ind = unpack_one(embed_ind, 'h *')
+
+        if exists(codebook_transform_fn):
+            transformed_embed = unpack_one(transformed_embed, 'h * c d')
 
         if self.training:
-            unpacked_onehot = unpack_one(embed_onehot, ps, 'h * c')
-            quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+            unpacked_onehot = unpack_one(embed_onehot, 'h * c')
+
+            if exists(codebook_transform_fn):
+                quantize = einsum('h b n c, h b n c d -> h b n d', unpacked_onehot, transformed_embed)
+            else:
+                quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+
         else:
-            quantize = batched_embedding(embed_ind, embed)
+            if exists(codebook_transform_fn):
+                quantize = einx.get_at('h b n [c] d, h b n -> h b n d', transformed_embed, embed_ind)
+            else:
+                quantize = einx.get_at('h [c] d, h b n -> h b n d', embed, embed_ind)
 
         if self.training and self.ema_update and not freeze_codebook:
 
@@ -493,23 +577,23 @@ class EuclideanCodebook(nn.Module):
             ema_inplace(self.cluster_size.data, cluster_size, self.decay)
 
             embed_sum = einsum('h n d, h n c -> h c d', flatten, embed_onehot)
-            self.all_reduce_fn(embed_sum.contiguous())
+            embed_sum = embed_sum.contiguous()
+            self.all_reduce_fn(embed_sum)
+
             ema_inplace(self.embed_avg.data, embed_sum, self.decay)
 
-            cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
-
-            embed_normalized = self.embed_avg / rearrange(cluster_size, '... -> ... 1')
-            self.embed.data.copy_(embed_normalized)
-            self.expire_codes_(x)
+            if not self.manual_ema_update:
+                self.update_ema()
+                self.expire_codes_(x)
 
         if needs_codebook_dim:
             quantize, embed_ind = map(lambda t: rearrange(t, '1 ... -> ...'), (quantize, embed_ind))
 
-        dist = unpack_one(dist, ps, 'h * d')
+        dist = unpack_one(dist, 'h * d')
 
         return quantize, embed_ind, dist
 
-class CosineSimCodebook(nn.Module):
+class CosineSimCodebook(Module):
     def __init__(
         self,
         dim,
@@ -526,12 +610,15 @@ class CosineSimCodebook(nn.Module):
         learnable_codebook = False,
         gumbel_sample = gumbel_sample,
         sample_codebook_temp = 1.,
-        ema_update = True
+        ema_update = True,
+        manual_ema_update = False
     ):
         super().__init__()
         self.transform_input = l2norm
 
         self.ema_update = ema_update
+        self.manual_ema_update = manual_ema_update
+
         self.decay = decay
 
         if not kmeans_init:
@@ -552,11 +639,14 @@ class CosineSimCodebook(nn.Module):
         self.sample_codebook_temp = sample_codebook_temp
 
         self.sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
+        self.replace_sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
         self.kmeans_all_reduce_fn = distributed.all_reduce if use_ddp and sync_kmeans else noop
         self.all_reduce_fn = distributed.all_reduce if use_ddp else noop
 
         self.register_buffer('initted', torch.Tensor([not kmeans_init]))
-        self.register_buffer('cluster_size', torch.zeros(num_codebooks, codebook_size))
+        self.register_buffer('cluster_size', torch.ones(num_codebooks, codebook_size))
         self.register_buffer('embed_avg', embed.clone())
 
         self.learnable_codebook = learnable_codebook
@@ -593,11 +683,8 @@ class CosineSimCodebook(nn.Module):
     def replace(self, batch_samples, batch_mask):
         batch_samples = l2norm(batch_samples)
 
-        for ind, (samples, mask) in enumerate(zip(batch_samples.unbind(dim = 0), batch_mask.unbind(dim = 0))):
-            if not torch.any(mask):
-                continue
-
-            sampled = self.sample_fn(rearrange(samples, '... -> 1 ...'), mask.sum().item())
+        for ind, (samples, mask) in enumerate(zip(batch_samples, batch_mask)):
+            sampled = self.replace_sample_fn(rearrange(samples, '... -> 1 ...'), mask.sum().item())
             sampled = rearrange(sampled, '1 ... -> ...')
 
             self.embed.data[ind][mask] = sampled
@@ -616,13 +703,22 @@ class CosineSimCodebook(nn.Module):
         batch_samples = rearrange(batch_samples, 'h ... d -> h (...) d')
         self.replace(batch_samples, batch_mask = expired_codes)
 
-    @autocast(enabled = False)
+    def update_ema(self):
+        cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
+
+        embed_normalized = self.embed_avg / rearrange(cluster_size, '... -> ... 1')
+        embed_normalized = l2norm(embed_normalized)
+
+        self.embed.data.copy_(embed_normalized)
+
+    @autocast('cuda', enabled = False)
     def forward(
         self,
         x,
         sample_codebook_temp = None,
         mask = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        codebook_transform_fn: Callable | None = None
     ):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -634,7 +730,7 @@ class CosineSimCodebook(nn.Module):
 
         dtype = x.dtype
 
-        flatten, ps = pack_one(x, 'h * d')
+        flatten, unpack_one = pack_one(x, 'h * d')
 
         if exists(mask):
             mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
@@ -643,16 +739,37 @@ class CosineSimCodebook(nn.Module):
 
         embed = self.embed if self.learnable_codebook else self.embed.detach()
 
-        dist = einsum('h n d, h c d -> h n c', flatten, embed)
+        # handle maybe implicit neural codebook
+        # and compute cosine sim distance
+
+        if exists(codebook_transform_fn):
+            transformed_embed = codebook_transform_fn(embed)
+            transformed_embed = rearrange(transformed_embed, 'h b n c d -> h (b n) c d')
+            transformed_embed = l2norm(transformed_embed)
+
+            dist = einsum('h n d, h n c d -> h n c', flatten, transformed_embed)
+        else:
+            dist = einsum('h n d, h c d -> h n c', flatten, embed)
 
         embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
-        embed_ind = unpack_one(embed_ind, ps, 'h *')
+        embed_ind = unpack_one(embed_ind, 'h *')
+
+        if exists(codebook_transform_fn):
+            transformed_embed = unpack_one(transformed_embed, 'h * c d')
 
         if self.training:
-            unpacked_onehot = unpack_one(embed_onehot, ps, 'h * c')
-            quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+            unpacked_onehot = unpack_one(embed_onehot, 'h * c')
+
+            if exists(codebook_transform_fn):
+                quantize = einsum('h b n c, h b n c d -> h b n d', unpacked_onehot, transformed_embed)
+            else:
+                quantize = einsum('h b n c, h c d -> h b n d', unpacked_onehot, embed)
+
         else:
-            quantize = batched_embedding(embed_ind, embed)
+            if exists(codebook_transform_fn):
+                quantize = einx.get_at('h b n [c] d, h b n -> h b n d', transformed_embed, embed_ind)
+            else:
+                quantize = einx.get_at('h [c] d, h b n -> h b n d', embed, embed_ind)
 
         if self.training and self.ema_update and not freeze_codebook:
             if exists(mask):
@@ -664,26 +781,31 @@ class CosineSimCodebook(nn.Module):
             ema_inplace(self.cluster_size.data, bins, self.decay)
 
             embed_sum = einsum('h n d, h n c -> h c d', flatten, embed_onehot)
-            self.all_reduce_fn(embed_sum.contiguous())
+            embed_sum = embed_sum.contiguous()
+            self.all_reduce_fn(embed_sum)
+
             ema_inplace(self.embed_avg.data, embed_sum, self.decay)
 
-            cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
-
-            embed_normalized = self.embed_avg / rearrange(cluster_size, '... -> ... 1')
-            embed_normalized = l2norm(embed_normalized)
-
-            self.embed.data.copy_(l2norm(embed_normalized))
-            self.expire_codes_(x)
+            if not self.manual_ema_update:
+                self.update_ema()
+                self.expire_codes_(x)
 
         if needs_codebook_dim:
             quantize, embed_ind = map(lambda t: rearrange(t, '1 ... -> ...'), (quantize, embed_ind))
 
-        dist = unpack_one(dist, ps, 'h * d')
+        dist = unpack_one(dist, 'h * d')
         return quantize, embed_ind, dist
 
 # main class
 
-class VectorQuantize(nn.Module):
+LossBreakdown = namedtuple('LossBreakdown', [
+    'commitment',
+    'codebook_diversity',
+    'orthogonal_reg',
+    'inplace_optimize',
+])
+
+class VectorQuantize(Module):
     def __init__(
         self,
         dim,
@@ -698,6 +820,7 @@ class VectorQuantize(nn.Module):
         kmeans_iters = 10,
         sync_kmeans = True,
         use_cosine_sim = False,
+        layernorm_after_project_in = False, # proposed by @SaltyChtao here https://github.com/lucidrains/vector-quantize-pytorch/issues/26#issuecomment-1324711561
         threshold_ema_dead_code = 0,
         channel_last = True,
         accept_image_fmap = False,
@@ -706,19 +829,24 @@ class VectorQuantize(nn.Module):
         orthogonal_reg_weight = 0.,
         orthogonal_reg_active_codes_only = False,
         orthogonal_reg_max_codes = None,
+        codebook_diversity_loss_weight = 0.,
+        codebook_diversity_temperature = 100.,
         stochastic_sample_codes = False,
         sample_codebook_temp = 1.,
         straight_through = False,
-        reinmax = False,  # using reinmax for improved straight-through, assuming straight through helps at all
+        rotation_trick = True,  # Propagate grads through VQ layer w/ rotation trick: https://arxiv.org/abs/2410.06424 by @cfifty
         sync_codebook = None,
         sync_affine_param = False,
         ema_update = True,
+        manual_ema_update = False,
         learnable_codebook = False,
         in_place_codebook_optimizer: Callable[..., Optimizer] = None, # Optimizer used to update the codebook embedding if using learnable_codebook
+        manual_in_place_optimizer_update = False,
         affine_param = False,
         affine_param_batch_decay = 0.99,
         affine_param_codebook_decay = 0.9,
-        sync_update_v = 0. # the v that controls optimistic vs pessimistic update for synchronous update rule (21) https://minyoungg.github.io/vqtorch/assets/draft_050523.pdf
+        sync_update_v = 0., # the v that controls optimistic vs pessimistic update for synchronous update rule (21) https://minyoungg.github.io/vqtorch/assets/draft_050523.pdf
+        return_zeros_for_masked_padding = True
     ):
         super().__init__()
         self.dim = dim
@@ -729,22 +857,37 @@ class VectorQuantize(nn.Module):
         codebook_input_dim = codebook_dim * heads
 
         requires_projection = codebook_input_dim != dim
-        self.project_in = nn.Linear(dim, codebook_input_dim) if requires_projection else nn.Identity()
+
+        self.project_in = Sequential(
+            nn.Linear(dim, codebook_input_dim),
+            nn.LayerNorm(codebook_input_dim) if layernorm_after_project_in else None
+        ) if requires_projection else nn.Identity()
+
         self.project_out = nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
 
         self.has_projections = requires_projection
 
         self.eps = eps
+
+        self.has_commitment_loss = commitment_weight > 0.
         self.commitment_weight = commitment_weight
         self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss # whether to use cross entropy loss to codebook as commitment loss
 
         self.learnable_codebook = learnable_codebook
 
-        has_codebook_orthogonal_loss = orthogonal_reg_weight > 0
+        has_codebook_orthogonal_loss = orthogonal_reg_weight > 0.
         self.has_codebook_orthogonal_loss = has_codebook_orthogonal_loss
         self.orthogonal_reg_weight = orthogonal_reg_weight
         self.orthogonal_reg_active_codes_only = orthogonal_reg_active_codes_only
         self.orthogonal_reg_max_codes = orthogonal_reg_max_codes
+
+        has_codebook_diversity_loss = codebook_diversity_loss_weight > 0.
+        self.has_codebook_diversity_loss = has_codebook_diversity_loss
+        self.codebook_diversity_temperature = codebook_diversity_temperature
+        self.codebook_diversity_loss_weight = codebook_diversity_loss_weight
+
+        assert not (straight_through and rotation_trick)
+        self.rotation_trick = rotation_trick
 
         assert not (ema_update and learnable_codebook), 'learnable codebook not compatible with EMA update'
 
@@ -758,12 +901,11 @@ class VectorQuantize(nn.Module):
         gumbel_sample_fn = partial(
             gumbel_sample,
             stochastic = stochastic_sample_codes,
-            reinmax = reinmax,
             straight_through = straight_through
         )
 
         if not exists(sync_codebook):
-            sync_codebook = distributed.is_initialized() and distributed.get_world_size() > 1
+            sync_codebook = is_distributed()
 
         codebook_kwargs = dict(
             dim = codebook_dim,
@@ -779,7 +921,8 @@ class VectorQuantize(nn.Module):
             learnable_codebook = has_codebook_orthogonal_loss or learnable_codebook,
             sample_codebook_temp = sample_codebook_temp,
             gumbel_sample = gumbel_sample_fn,
-            ema_update = ema_update
+            ema_update = ema_update,
+            manual_ema_update = manual_ema_update
         )
 
         if affine_param:
@@ -792,14 +935,21 @@ class VectorQuantize(nn.Module):
                 affine_param_codebook_decay = affine_param_codebook_decay,
             )
 
+        self.use_cosine_sim = use_cosine_sim
         self._codebook = codebook_class(**codebook_kwargs)
 
         self.in_place_codebook_optimizer = in_place_codebook_optimizer(self._codebook.parameters()) if exists(in_place_codebook_optimizer) else None
+        self.manual_in_place_optimizer_update = manual_in_place_optimizer_update
 
         self.codebook_size = codebook_size
 
         self.accept_image_fmap = accept_image_fmap
         self.channel_last = channel_last
+
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
+        # for variable lengthed sequences, whether to take care of masking out the padding to 0 (or return the original input)
+        self.return_zeros_for_masked_padding = return_zeros_for_masked_padding
 
     @property
     def codebook(self):
@@ -823,32 +973,66 @@ class VectorQuantize(nn.Module):
 
         if not is_multiheaded:
             codes = codebook[indices]
-            return rearrange(codes, '... h d -> ... (h d)')
+        else:
+            indices, unpack_one = pack_one(indices, 'b * h')
+            indices = rearrange(indices, 'b n h -> b h n')
 
-        indices, ps = pack_one(indices, 'b * h')
-        indices = rearrange(indices, 'b n h -> b h n')
+            indices = repeat(indices, 'b h n -> b h n d', d = codebook.shape[-1])
+            codebook = repeat(codebook, 'h n d -> b h n d', b = indices.shape[0])
 
-        indices = repeat(indices, 'b h n -> b h n d', d = codebook.shape[-1])
-        codebook = repeat(codebook, 'h n d -> b h n d', b = indices.shape[0])
+            codes = codebook.gather(2, indices)
+            codes = rearrange(codes, 'b h n d -> b n (h d)')
+            codes = unpack_one(codes, 'b * d')
 
-        codes = codebook.gather(2, indices)
-        codes = rearrange(codes, 'b h n d -> b n (h d)')
-        codes = unpack_one(codes, ps, 'b * d')
+        if not self.channel_last:
+            codes = rearrange(codes, 'b ... d -> b d ...')
+
         return codes
 
     def get_output_from_indices(self, indices):
         codes = self.get_codes_from_indices(indices)
         return self.project_out(codes)
 
+    def update_in_place_optimizer(self):
+        if not exists(self.in_place_codebook_optimizer):
+            return
+
+        self.in_place_codebook_optimizer.step()
+        self.in_place_codebook_optimizer.zero_grad()
+
+    def maybe_split_heads_from_input(self, x):
+        if self.heads == 1:
+            return x
+
+        ein_rhs_eq = 'h b n d' if self.separate_codebook_per_head else '1 (b h) n d'
+        return rearrange(x, f'b n (h d) -> {ein_rhs_eq}', h = self.heads)
+
+    def expire_codes_(self, x):
+        x = self._codebook.transform_input(x)
+        x = self.maybe_split_heads_from_input(x)
+        self._codebook.expire_codes_(x)
+
     def forward(
         self,
         x,
         indices = None,
         mask = None,
+        lens = None,
         sample_codebook_temp = None,
-        freeze_codebook = False
+        freeze_codebook = False,
+        return_loss_breakdown = False,
+        codebook_transform_fn: Callable | None = None
     ):
         orig_input = x
+
+        # handle masking, either passed in as `mask` or `lens`
+
+        assert not (exists(mask) and exists(lens))
+
+        if exists(lens):
+            mask = lens_to_mask(lens, x.shape[1])
+
+        # handle one token given
 
         only_one = x.ndim == 2
 
@@ -864,6 +1048,7 @@ class VectorQuantize(nn.Module):
         # rearrange inputs
 
         if self.accept_image_fmap:
+            assert not exists(mask)
             height, width = x.shape[-2:]
             x = rearrange(x, 'b c h w -> b (h w) c')
 
@@ -876,9 +1061,7 @@ class VectorQuantize(nn.Module):
 
         # handle multi-headed separate codebooks
 
-        if is_multiheaded:
-            ein_rhs_eq = 'h b n d' if self.separate_codebook_per_head else '1 (b h) n d'
-            x = rearrange(x, f'b n (h d) -> {ein_rhs_eq}', h = heads)
+        x = self.maybe_split_heads_from_input(x)
 
         # l2norm for cosine sim, otherwise identity
 
@@ -889,12 +1072,17 @@ class VectorQuantize(nn.Module):
         codebook_forward_kwargs = dict(
             sample_codebook_temp = sample_codebook_temp,
             mask = mask,
-            freeze_codebook = freeze_codebook
+            freeze_codebook = freeze_codebook,
+            codebook_transform_fn = codebook_transform_fn
         )
 
         # quantize
 
         quantize, embed_ind, distances = self._codebook(x, **codebook_forward_kwargs)
+
+        # losses for loss breakdown
+
+        commit_loss = orthogonal_reg_loss = inplace_optimize_loss = codebook_diversity_loss = self.zero
 
         # one step in-place update
 
@@ -913,8 +1101,11 @@ class VectorQuantize(nn.Module):
                 loss = F.mse_loss(quantize, x.detach())
 
             loss.backward()
-            self.in_place_codebook_optimizer.step()
-            self.in_place_codebook_optimizer.zero_grad()
+
+            if not self.manual_in_place_optimizer_update:
+                self.update_in_place_optimizer()
+
+            inplace_optimize_loss = loss
 
             # quantize again
 
@@ -924,11 +1115,13 @@ class VectorQuantize(nn.Module):
             # determine code to use for commitment loss
             maybe_detach = torch.detach if not self.learnable_codebook or freeze_codebook else identity
 
-            commit_quantize = maybe_detach(quantize)            
+            commit_quantize = maybe_detach(quantize)
 
-            # straight through
-
-            quantize = x + (quantize - x).detach()
+            if self.rotation_trick:
+                quantize = rotate_to(x, quantize)
+            else:
+                # standard STE to get gradients through VQ layer.
+                quantize = x + (quantize - x).detach()
 
             if self.sync_update_v > 0.:
                 # (21) in https://minyoungg.github.io/vqtorch/assets/draft_050523.pdf
@@ -979,7 +1172,18 @@ class VectorQuantize(nn.Module):
         loss = torch.tensor([0.], device = device, requires_grad = self.training)
 
         if self.training:
-            if self.commitment_weight > 0:
+            # calculate codebook diversity loss (negative of entropy) if needed
+
+            if self.has_codebook_diversity_loss:
+                prob = (-distances * self.codebook_diversity_temperature).softmax(dim = -1)
+                avg_prob = reduce(prob, '... n l -> n l', 'mean')
+                codebook_diversity_loss = -entropy(avg_prob).mean()
+
+                loss = loss + codebook_diversity_loss * self.codebook_diversity_loss_weight
+
+            # commitment loss
+
+            if self.has_commitment_loss:
                 if self.commitment_use_cross_entropy_loss:
                     if exists(mask):
                         ce_loss_mask = mask
@@ -1049,10 +1253,28 @@ class VectorQuantize(nn.Module):
         # if masking, only return quantized for where mask has True
 
         if exists(mask):
-            quantize = torch.where(
-                rearrange(mask, '... -> ... 1'),
+            masked_out_value = orig_input
+
+            if self.return_zeros_for_masked_padding:
+                masked_out_value = torch.zeros_like(orig_input)
+
+            quantize = einx.where(
+                'b n, b n d, b n d -> b n d',
+                mask,
                 quantize,
-                orig_input
+                masked_out_value
             )
 
-        return quantize, embed_ind, loss
+            embed_ind = einx.where(
+                'b n, b n ..., -> b n ...',
+                mask,
+                embed_ind,
+                -1
+            )
+
+        if not return_loss_breakdown:
+            return quantize, embed_ind, loss
+
+        loss_breakdown = LossBreakdown(commit_loss, codebook_diversity_loss, orthogonal_reg_loss, inplace_optimize_loss)
+
+        return quantize, embed_ind, loss, loss_breakdown

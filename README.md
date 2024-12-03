@@ -27,6 +27,7 @@ vq = VectorQuantize(
 
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = vq(x) # (1, 1024, 256), (1, 1024), (1)
+
 ```
 
 ## Residual VQ
@@ -46,16 +47,14 @@ residual_vq = ResidualVQ(
 x = torch.randn(1, 1024, 256)
 
 quantized, indices, commit_loss = residual_vq(x)
-
+print(quantized.shape, indices.shape, commit_loss.shape)
 # (1, 1024, 256), (1, 1024, 8), (1, 8)
-# (batch, seq, dim), (batch, seq, quantizer), (batch, quantizer)
 
 # if you need all the codes across the quantization layers, just pass return_all_codes = True
 
 quantized, indices, commit_loss, all_codes = residual_vq(x, return_all_codes = True)
 
-# *_, (8, 1, 1024, 256)
-# all_codes - (quantizer, batch, seq, dim)
+# (8, 1, 1024, 256)
 ```
 
 Furthermore, <a href="https://arxiv.org/abs/2203.01941">this paper</a> uses Residual-VQ to construct the RQ-VAE, for generating high resolution images with more compressed codes.
@@ -78,8 +77,7 @@ residual_vq = ResidualVQ(
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = residual_vq(x)
 
-# (1, 1024, 256), (8, 1, 1024), (8, 1)
-# (batch, seq, dim), (quantizer, batch, seq), (quantizer, batch)
+# (1, 1024, 256), (1, 1024, 8), (1, 8)
 ```
 
 <a href="https://arxiv.org/abs/2305.02765">A recent paper</a> further proposes to do residual VQ on groups of the feature dimension, showing equivalent results to Encodec while using far fewer codebooks. You can use it by importing `GroupedResidualVQ`
@@ -100,8 +98,6 @@ x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = residual_vq(x)
 
 # (1, 1024, 256), (2, 1, 1024, 8), (2, 1, 8)
-# (batch, seq, dim), (groups, batch, seq, quantizer), (groups, batch, quantizer)
-
 ```
 
 ## Initialization
@@ -122,6 +118,22 @@ residual_vq = ResidualVQ(
 
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = residual_vq(x)
+
+# (1, 1024, 256), (1, 1024, 4), (1, 4)
+```
+
+## Gradient Computation
+
+VQ-VAEs are traditionally trained with the straight-through estimator (STE). During the backwards pass, the gradient flows _around_ the VQ layer rather than _through_ it. The <a href="https://arxiv.org/abs/2410.06424">rotation trick paper</a> proposes to transform the gradient _through_ the VQ layer so the relative angle and magnitude between the input vector and quantized output are encoded into the gradient. You can enable or disable this feature with ```rotation_trick=True/False``` in the ```VectorQuantize``` class.
+
+```python
+from vector_quantize_pytorch import VectorQuantize
+
+vq_layer = VectorQuantize(
+    dim = 256,
+    codebook_size = 256,
+    rotation_trick = True,   # Set to False to use the STE gradient estimator or True to use the rotation trick.
+)
 ```
 
 ## Increasing codebook usage
@@ -144,6 +156,8 @@ vq = VectorQuantize(
 
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = vq(x)
+
+# (1, 1024, 256), (1, 1024), (1,)
 ```
 
 ### Cosine similarity
@@ -162,6 +176,8 @@ vq = VectorQuantize(
 
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = vq(x)
+
+# (1, 1024, 256), (1, 1024), (1,)
 ```
 
 ### Expiring stale codes
@@ -180,6 +196,8 @@ vq = VectorQuantize(
 
 x = torch.randn(1, 1024, 256)
 quantized, indices, commit_loss = vq(x)
+
+# (1, 1024, 256), (1, 1024), (1,)
 ```
 
 ### Orthogonal regularization loss
@@ -203,6 +221,7 @@ vq = VectorQuantize(
 
 img_fmap = torch.randn(1, 256, 32, 32)
 quantized, indices, loss = vq(img_fmap) # (1, 256, 32, 32), (1, 32, 32), (1,)
+
 # loss now contains the orthogonal regularization loss with the weight as assigned
 ```
 
@@ -226,10 +245,12 @@ vq = VectorQuantize(
 )
 
 img_fmap = torch.randn(1, 256, 32, 32)
-quantized, indices, loss = vq(img_fmap) # (1, 256, 32, 32), (1, 32, 32, 8), (1,)
+quantized, indices, loss = vq(img_fmap)
 
-# indices shape - (batch, height, width, heads)
+# (1, 256, 32, 32), (1, 32, 32, 8), (1,)
+
 ```
+
 ### Random Projection Quantizer
 
 <a href="https://arxiv.org/abs/2202.01855">This paper</a> first proposed to use a random projection quantizer for masked speech modeling, where signals are projected with a randomly initialized matrix and then matched with a random initialized codebook. One therefore does not need to learn the quantizer. This technique was used by Google's <a href="https://ai.googleblog.com/2023/03/universal-speech-model-usm-state-of-art.html">Universal Speech Model</a> to achieve SOTA for speech-to-text modeling.
@@ -248,10 +269,57 @@ quantizer = RandomProjectionQuantizer(
 )
 
 x = torch.randn(1, 1024, 512)
-indices = quantizer(x) # (1, 1024, 16) - (batch, seq, num_codebooks)
+indices = quantizer(x)
+
+# (1, 1024, 16)
 ```
 
 This repository should also automatically synchronizing the codebooks in a multi-process setting. If somehow it isn't, please open an issue. You can override whether to synchronize codebooks or not by setting `sync_codebook = True | False`
+
+### Sim VQ
+
+<img src="./images/simvq.png" width="400px"></img>
+
+A <a href="https://arxiv.org/abs/2411.02038">new ICLR 2025 paper</a> proposes a scheme where the codebook is frozen, and the codes are implicitly generated through a linear projection. The authors claim this setup leads to less codebook collapse as well as easier convergence. I have found this to perform even better when paired with <a href="https://arxiv.org/abs/2410.06424">rotation trick</a> from Fifty et al., and expanding the linear projection to a small one layer MLP. You can experiment with it as so
+
+Update: hearing mixed results
+
+```python
+import torch
+from vector_quantize_pytorch import SimVQ
+
+sim_vq = SimVQ(
+    dim = 512,
+    codebook_size = 1024,
+    rotation_trick = True  # use rotation trick from Fifty et al.
+)
+
+x = torch.randn(1, 1024, 512)
+quantized, indices, commit_loss = sim_vq(x)
+
+assert x.shape == quantized.shape
+assert torch.allclose(quantized, sim_vq.indices_to_codes(indices), atol = 1e-6)
+```
+
+For the residual flavor, just import `ResidualSimVQ` instead
+
+```python
+import torch
+from vector_quantize_pytorch import ResidualSimVQ
+
+residual_sim_vq = ResidualSimVQ(
+    dim = 512,
+    num_quantizers = 4,
+    codebook_size = 1024,
+    rotation_trick = True  # use rotation trick from Fifty et al.
+)
+
+x = torch.randn(1, 1024, 512)
+quantized, indices, commit_loss = residual_sim_vq(x)
+
+assert x.shape == quantized.shape
+assert torch.allclose(quantized, residual_sim_vq.get_output_from_indices(indices), atol = 1e-6)
+```
 
 ### Finite Scalar Quantization
 
@@ -273,16 +341,15 @@ Thanks goes out to [@sekstini](https://github.com/sekstini) for porting over thi
 import torch
 from vector_quantize_pytorch import FSQ
 
-levels = [8,5,5,5] # see 4.1 and A.4.1 in the paper
-quantizer = FSQ(levels)
+quantizer = FSQ(
+    levels = [8, 5, 5, 5]
+)
 
 x = torch.randn(1, 1024, 4) # 4 since there are 4 levels
 xhat, indices = quantizer(x)
 
-print(xhat.shape)    # (1, 1024, 4) - (batch, seq, dim)
-print(indices.shape) # (1, 1024)    - (batch, seq)
+# (1, 1024, 4), (1, 1024)
 
-assert xhat.shape == x.shape
 assert torch.all(xhat == quantizer.indices_to_codes(indices))
 ```
 
@@ -306,13 +373,11 @@ residual_fsq.eval()
 
 quantized, indices = residual_fsq(x)
 
-# (1, 1024, 256), (1, 1024, 8), (8)
-# (batch, seq, dim), (batch, seq, quantizers), (quantizers)
+# (1, 1024, 256), (1, 1024, 8)
 
 quantized_out = residual_fsq.get_output_from_indices(indices)
 
-# (8, 1, 1024, 8)
-# (residual layers, batch, seq, quantizers)
+# (1, 1024, 256)
 
 assert torch.all(quantized == quantized_out)
 ```
@@ -345,17 +410,25 @@ quantizer = LFQ(
 
 image_feats = torch.randn(1, 16, 32, 32)
 
-quantized, indices, entropy_aux_loss = quantizer(image_feats)
+quantized, indices, entropy_aux_loss = quantizer(image_feats, inv_temperature=100.)  # you may want to experiment with temperature
 
-# (1, 16, 32, 32), (1, 32, 32), (1,)
+# (1, 16, 32, 32), (1, 32, 32), ()
 
-assert image_feats.shape == quantized.shape
 assert (quantized == quantizer.indices_to_codes(indices)).all()
 ```
 
 You can also pass in video features as `(batch, feat, time, height, width)` or sequences as `(batch, seq, feat)`
 
 ```python
+import torch
+from vector_quantize_pytorch import LFQ
+
+quantizer = LFQ(
+    codebook_size = 65536,
+    dim = 16,
+    entropy_loss_weight = 0.1,
+    diversity_gamma = 1.
+)
 
 seq = torch.randn(1, 32, 16)
 quantized, *_ = quantizer(seq)
@@ -366,7 +439,6 @@ video_feats = torch.randn(1, 16, 10, 32, 32)
 quantized, *_ = quantizer(video_feats)
 
 assert video_feats.shape == quantized.shape
-
 ```
 
 Or support multiple codebooks
@@ -385,7 +457,7 @@ image_feats = torch.randn(1, 16, 32, 32)
 
 quantized, indices, entropy_aux_loss = quantizer(image_feats)
 
-# (1, 16, 32, 32), (1, 32, 32, 4), (1,)
+# (1, 16, 32, 32), (1, 32, 32, 4), ()
 
 assert image_feats.shape == quantized.shape
 assert (quantized == quantizer.indices_to_codes(indices)).all()
@@ -410,14 +482,90 @@ residual_lfq.eval()
 quantized, indices, commit_loss = residual_lfq(x)
 
 # (1, 1024, 256), (1, 1024, 8), (8)
-# (batch, seq, dim), (batch, seq, quantizers), (quantizers)
 
 quantized_out = residual_lfq.get_output_from_indices(indices)
 
-# (8, 1, 1024, 8)
-# (residual layers, batch, seq, quantizers)
+# (1, 1024, 256)
 
 assert torch.all(quantized == quantized_out)
+```
+
+### Latent Quantization
+
+Disentanglement is essential for representation learning as it promotes interpretability, generalization, improved learning, and robustness. It aligns with the goal of capturing meaningful and independent features of the data, facilitating more effective use of learned representations across various applications. For better disentanglement, the challenge is to disentangle underlying variations in a dataset without explicit ground truth information. This work introduces a key inductive bias aimed at encoding and decoding within an organized latent space. The strategy incorporated encompasses discretizing the latent space by assigning discrete code vectors through the utilization of an individual learnable scalar codebook for each dimension. This methodology enables their models to surpass robust prior methods effectively.
+
+Be aware they had to use a very high weight decay for the results in this paper.
+
+```python
+import torch
+from vector_quantize_pytorch import LatentQuantize
+
+# you can specify either dim or codebook_size
+# if both specified, will be validated against each other
+
+quantizer = LatentQuantize(
+    levels = [5, 5, 8],      # number of levels per codebook dimension
+    dim = 16,                   # input dim
+    commitment_loss_weight=0.1,  
+    quantization_loss_weight=0.1,
+)
+
+image_feats = torch.randn(1, 16, 32, 32)
+
+quantized, indices, loss = quantizer(image_feats)
+
+# (1, 16, 32, 32), (1, 32, 32), ()
+
+assert image_feats.shape == quantized.shape
+assert (quantized == quantizer.indices_to_codes(indices)).all()
+```
+
+You can also pass in video features as `(batch, feat, time, height, width)` or sequences as `(batch, seq, feat)`
+
+```python
+
+import torch
+from vector_quantize_pytorch import LatentQuantize
+
+quantizer = LatentQuantize(
+    levels = [5, 5, 8],
+    dim = 16,
+    commitment_loss_weight=0.1,  
+    quantization_loss_weight=0.1,
+)
+
+seq = torch.randn(1, 32, 16)
+quantized, *_ = quantizer(seq)
+
+# (1, 32, 16)
+
+video_feats = torch.randn(1, 16, 10, 32, 32)
+quantized, *_ = quantizer(video_feats)
+
+# (1, 16, 10, 32, 32)
+
+```
+
+Or support multiple codebooks
+
+```python
+import torch
+from vector_quantize_pytorch import LatentQuantize
+
+model = LatentQuantize(
+    levels = [4, 8, 16],
+    dim = 9,
+    num_codebooks = 3
+)
+
+input_tensor = torch.randn(2, 3, dim)
+output_tensor, indices, loss = model(input_tensor)
+
+# (2, 3, 9), (2, 3, 3), ()
+
+assert output_tensor.shape == input_tensor.shape
+assert indices.shape == (2, 3, num_codebooks)
+assert loss.item() >= 0
 ```
 
 ## Citations
@@ -456,11 +604,12 @@ assert torch.all(quantized == quantized_out)
 ```
 
 ```bibtex
-@unknown{unknown,
+@inproceedings{lee2022autoregressive,
+    title   = {Autoregressive Image Generation using Residual Quantization},
     author  = {Lee, Doyup and Kim, Chiheon and Kim, Saehoon and Cho, Minsu and Han, Wook-Shin},
-    year    = {2022},
-    month   = {03},
-    title   = {Autoregressive Image Generation using Residual Quantization}
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+    pages   = {11523--11532},
+    year    = {2022}
 }
 ```
 
@@ -504,16 +653,6 @@ assert torch.all(quantized == quantized_out)
     title   = {HiFi-Codec: Group-residual Vector quantization for High Fidelity Audio Codec},
     author  = {Dongchao Yang and Songxiang Liu and Rongjie Huang and Jinchuan Tian and Chao Weng and Yuexian Zou},
     year    = {2023}
-}
-```
-
-```bibtex
-@article{Liu2023BridgingDA,
-    title   = {Bridging Discrete and Backpropagation: Straight-Through and Beyond},
-    author  = {Liyuan Liu and Chengyu Dong and Xiaodong Liu and Bin Yu and Jianfeng Gao},
-    journal = {ArXiv},
-    year    = {2023},
-    volume  = {abs/2304.08612}
 }
 ```
 
@@ -567,5 +706,65 @@ assert torch.all(quantized == quantized_out)
     eprint  = {2310.05737},
     archivePrefix = {arXiv},
     primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@inproceedings{Zhao2024ImageAV,
+  title     = {Image and Video Tokenization with Binary Spherical Quantization},
+  author    = {Yue Zhao and Yuanjun Xiong and Philipp Krahenbuhl},
+  year      = {2024},
+  url       = {https://api.semanticscholar.org/CorpusID:270380237}
+}
+```
+
+```bibtex
+@misc{hsu2023disentanglement,
+    title   = {Disentanglement via Latent Quantization}, 
+    author  = {Kyle Hsu and Will Dorrell and James C. R. Whittington and Jiajun Wu and Chelsea Finn},
+    year    = {2023},
+    eprint  = {2305.18378},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG}
+}
+```
+
+```bibtex
+@inproceedings{Irie2023SelfOrganisingND,
+    title   = {Self-Organising Neural Discrete Representation Learning \`a la Kohonen},
+    author  = {Kazuki Irie and R'obert Csord'as and J{\"u}rgen Schmidhuber},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:256901024}
+}
+```
+
+```bibtex
+@article{Huijben2024ResidualQW,
+    title   = {Residual Quantization with Implicit Neural Codebooks},
+    author  = {Iris Huijben and Matthijs Douze and Matthew Muckley and Ruud van Sloun and Jakob Verbeek},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2401.14732},
+    url     = {https://api.semanticscholar.org/CorpusID:267301189}
+}
+```
+
+```bibtex
+@article{Fifty2024Restructuring,
+    title   = {Restructuring Vector Quantization with the Rotation Trick},
+    author  = {Christopher Fifty, Ronald G. Junkins, Dennis Duan, Aniketh Iyengar, Jerry W. Liu, Ehsan Amid, Sebastian Thrun, Christopher Ré},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2410.06424},
+    url     = {https://api.semanticscholar.org/CorpusID:273229218}
+}
+```
+
+```bibtex
+@inproceedings{Zhu2024AddressingRC,
+    title   = {Addressing Representation Collapse in Vector Quantized Models with One Linear Layer},
+    author  = {Yongxin Zhu and Bocheng Li and Yifei Xin and Linli Xu},
+    year    = {2024},
+    url     = {https://api.semanticscholar.org/CorpusID:273812459}
 }
 ```
